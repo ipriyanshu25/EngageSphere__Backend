@@ -4,6 +4,7 @@ const jwt         = require('jsonwebtoken');
 const nodemailer  = require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
 const User        = require('../model/user');
+const Country = require('../model/country');
 const JWT_SECRET  = process.env.JWT_SECRET;
 
 // configure your SMTP transporter
@@ -84,11 +85,100 @@ exports.verifyOtpUser = async (req, res) => {
   }
 };
 
-/**
- * Step 3: (Optional) If you want a separate “register” after OTP,
- * you can check otpVerified and name/password already set.
- * Otherwise, the above verifyOtpUser already seeds the user record.
- */
+
+exports.registerUser = async (req, res) => {
+  const {
+    email,
+    name,
+    password,
+    phone,
+    address,
+    countryId,
+    callingId,
+    bio = '',
+    gender
+  } = req.body;
+
+  // Basic validation
+  if (
+    !email ||
+    !name ||
+    !password ||
+    !phone ||
+    !countryId ||
+    !callingId ||
+    gender == null
+  ) {
+    return res.status(400).json({ message: 'Missing required registration fields' });
+  }
+
+  // Map gender input to enum 0/1/2
+  const genderMap = { male: 0, female: 1, other: 2 };
+  let genderVal;
+  if (typeof gender === 'string') {
+    const gLower = gender.toLowerCase();
+    if (genderMap[gLower] == null) {
+      return res.status(400).json({ message: 'Invalid gender; must be "male", "female", or "other"' });
+    }
+    genderVal = genderMap[gLower];
+  } else if ([0,1,2].includes(Number(gender))) {
+    genderVal = Number(gender);
+  } else {
+    return res.status(400).json({ message: 'Invalid gender value' });
+  }
+
+  try {
+    // 1) Fetch the user who must have otpVerified=true
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
+    if (!user) {
+      return res.status(404).json({ message: 'No OTP request found for this email' });
+    }
+    if (!user.otpVerified) {
+      return res.status(403).json({ message: 'Email not yet verified' });
+    }
+    if (user.name && user.password) {
+      return res.status(400).json({ message: 'User already registered' });
+    }
+
+    // 2) Ensure phone is unique
+    const existingPhone = await User.findOne({ phone: phone.trim() });
+    if (existingPhone && existingPhone.email !== user.email) {
+      return res.status(409).json({ message: 'Phone number already in use' });
+    }
+
+    // 3) Lookup Country docs
+    const [ countryDoc, callingDoc ] = await Promise.all([
+      Country.findById(countryId),
+      Country.findById(callingId)
+    ]);
+    if (!countryDoc || !callingDoc) {
+      return res.status(400).json({ message: 'Invalid countryId or callingId' });
+    }
+
+    // 4) Apply the profile fields
+    user.name         = name;
+    user.password     = password;               // will be hashed by pre('save')
+    user.phone        = phone.trim();
+    user.address      = address || '';
+    user.countryId    = countryId;
+    user.country      = countryDoc.name;
+    user.callingId    = callingId;
+    user.callingcode  = callingDoc.callingCode;
+    user.bio          = bio;
+    user.gender       = genderVal;
+
+    // 5) Save (triggers password hash)
+    await user.save();
+
+    return res.status(201).json({
+      message: 'User registered successfully',
+      userId: user.userId
+    });
+  } catch (err) {
+    console.error('registerUser error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
 
 /**
  * Login — exactly like before but guard on otpVerified
@@ -120,66 +210,6 @@ exports.loginUser = async (req, res) => {
     });
   } catch(err) {
     console.error('loginUser error:', err);
-    return res.status(500).json({ message: 'Internal server error' });
-  }
-};
-
-
-exports.registerUser = async (req, res) => {
-  const {
-    email,
-    name,
-    password,
-    phone,
-    address,
-    countryId,
-    country,
-    callingId,
-    callingcode,
-    bio = '',
-    gender
-  } = req.body;
-
-  // Basic validation
-  if (!email || !name || !password || !countryId || !country || !callingId || !callingcode || gender == null) {
-    return res.status(400).json({ message: 'Missing required registration fields' });
-  }
-
-  try {
-    // 1) Fetch the user who must have otpVerified=true
-    const user = await User.findOne({ email: email.trim().toLowerCase() });
-
-    if (!user) {
-      return res.status(404).json({ message: 'No OTP request found for this email' });
-    }
-    if (!user.otpVerified) {
-      return res.status(403).json({ message: 'Email not yet verified' });
-    }
-    if (user.name && user.password) {
-      return res.status(400).json({ message: 'User already registered' });
-    }
-
-    // 2) Apply the profile fields
-    user.name        = name;
-    user.password    = password;   // will be hashed by pre('save')
-    user.phone       = phone;
-    user.address     = address;
-    user.countryId   = countryId;
-    user.country     = country;
-    user.callingId   = callingId;
-    user.callingcode = callingcode;
-    user.bio         = bio;
-    user.gender      = Number(gender);
-
-    // 3) Save (triggers password hash)
-    await user.save();
-
-    return res.status(201).json({
-      message: 'User registered successfully',
-      userId: user.userId
-    });
-  } catch (err) {
-    console.error('registerUser error:', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
