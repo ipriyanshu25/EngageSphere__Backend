@@ -92,7 +92,7 @@ exports.registerUser = async (req, res) => {
     name,
     password,
     phone,
-    address,
+    address='',
     countryId,
     callingId,
     bio = '',
@@ -113,18 +113,11 @@ exports.registerUser = async (req, res) => {
   }
 
   // Map gender input to enum 0/1/2
-  const genderMap = { male: 0, female: 1, other: 2 };
-  let genderVal;
-  if (typeof gender === 'string') {
-    const gLower = gender.toLowerCase();
-    if (genderMap[gLower] == null) {
-      return res.status(400).json({ message: 'Invalid gender; must be "male", "female", or "other"' });
-    }
-    genderVal = genderMap[gLower];
-  } else if ([0,1,2].includes(Number(gender))) {
-    genderVal = Number(gender);
-  } else {
-    return res.status(400).json({ message: 'Invalid gender value' });
+const genderVal = Number(gender);
+  if (![0, 1, 2].includes(genderVal)) {
+    return res.status(400).json({
+      message: 'Invalid gender value; must be 0 (male), 1 (female), or 2 (other)'
+    });
   }
 
   try {
@@ -302,8 +295,7 @@ exports.getAllUsersSimple = async (req, res) => {
  */
 exports.updateProfile = async (req, res) => {
   try {
-    const userId = req.user.userId;
-    const { name, phone, address, oldPassword, newPassword } = req.body;
+    const { name, phone, address, oldPassword, newPassword ,userId} = req.body;
 
     const user = await User.findOne({ userId });
     if (!user)
