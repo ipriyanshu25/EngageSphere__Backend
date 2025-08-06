@@ -1,141 +1,150 @@
 require('dotenv').config();
-const Razorpay   = require('razorpay');
-const crypto     = require('crypto');
-const Payment    = require('../model/payment');
-const User       = require('../model/user');
-const Plan       = require('../model/plan');
+const Razorpay    = require('razorpay');
+const crypto      = require('crypto');
+const Payment     = require('../model/payment');
+const Subscription= require('../model/Subscription');
+const User        = require('../model/user');
+const Plan        = require('../model/plan');
 
-// initialize Razorpay client
+// ── Razorpay client ─────────────────────────────────────────────
 const razorpay = new Razorpay({
-  key_id:    process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
+  key_id:     process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET
 });
 
-/**
- * Create a new Razorpay order and persist it in the Payment collection,
- * storing only userId and planId.
- */
+// ── Create Order ────────────────────────────────────────────────
 exports.createOrder = async (req, res) => {
   try {
     const { userId, planId, pricingId, currency = 'USD', receipt } = req.body;
+    if (!userId || !planId || !pricingId)
+      return res.status(400).json({ success: false, message: 'userId, planId, pricingId required' });
 
-    // 1. Validate required fields
-    if (!userId || !planId || !pricingId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Missing required fields: userId, planId, pricingId'
-      });
-    }
+    // user & plan checks
+    const [ user, plan ] = await Promise.all([
+      User.findOne({ userId }),
+      Plan.findOne({ planId })
+    ]);
+    if (!user)  return res.status(404).json({ success:false, message:'User not found' });
+    if (!plan)  return res.status(404).json({ success:false, message:'Plan not found' });
 
-    // 2. Verify user exists
-    const user = await User.findOne({ userId });
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    // 3. Verify plan exists
-    const plan = await Plan.findOne({ planId });
-    if (!plan) {
-      return res.status(404).json({ success: false, message: 'Plan not found' });
-    }
-
-    // 4. Locate the pricing tier
+    // pricing tier
     const tier = plan.pricing.find(p => p.pricingId === pricingId);
-    if (!tier) {
-      return res.status(404).json({
-        success: false,
-        message: `Pricing option ${pricingId} not found for plan ${planId}`
-      });
-    }
+    if (!tier)  return res.status(404).json({ success:false, message:'Tier not found' });
 
-    // 5. Convert "$24.99" → 2499 (cents)
-    const amountCents = Math.round(parseFloat(tier.price.replace(/[^0-9.-]+/g,"")) * 100);
+    // price -> minor units
+    const amount = Math.round(parseFloat(tier.price.replace(/[^0-9.-]+/g,''))*100);
 
-    // 6. Create Razorpay order
-    const options = {
-      amount:  amountCents,
+    // Razorpay order
+    const order = await razorpay.orders.create({
+      amount,
       currency,
-      receipt: receipt || crypto.randomBytes(10).toString('hex'),
-    };
-    const order = await razorpay.orders.create(options);
-
-    // 7. Persist minimal record
-    await Payment.create({
-      orderId:   order.id,
-      amount:    order.amount,
-      currency:  order.currency,
-      receipt:   order.receipt,
-      userId,
-      planId,
-      pricingId,           // track which tier was chosen
-      status:    'created',
-      createdAt: new Date(),
+      receipt: receipt || crypto.randomBytes(10).toString('hex')
     });
 
-    return res.status(201).json({ success: true, order });
-  } catch (error) {
-    console.error('Error in createOrder:', error);
-    return res.status(500).json({ success: false, message: error.message });
+    // Payment + pending Subscription
+    await Promise.all([
+      Payment.create({
+        orderId:  order.id,
+        amount,
+        currency,
+        receipt:  order.receipt,
+        userId,
+        planId,
+        pricingId,
+        status:   'created'
+      }),
+      Subscription.create({
+        userId,
+        planId,
+        pricingId,
+        orderId:     order.id,
+        amount,
+        currency,
+        status:      'pending'
+      })
+    ]);
+
+    res.status(201).json({ success:true, order });
+  } catch (err) {
+    console.error('createOrder error:', err);
+    res.status(500).json({ success:false, message:err.message });
   }
 };
 
-
-/**
- * Verify Razorpay signature, update status to 'paid',
- * and return success/failure.
- */
+// ── Verify Payment ──────────────────────────────────────────────
 exports.verifyPayment = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
 
-    // Validate signature
-    const hmac = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-                       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-                       .digest('hex');
-    if (hmac !== razorpay_signature) {
+    /* 1. Signature check -------------------------------------------------- */
+    const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+                              .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+                              .digest('hex');
+
+    if (expectedSig !== razorpay_signature) {
       await Payment.findOneAndUpdate(
         { orderId: razorpay_order_id },
-        { status: 'failed' }
+        { status: 'failed' },
+        { session }
       );
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid signature'
-      });
+      await session.commitTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid signature' });
     }
 
-    // Fetch payment status from Razorpay
-    const razorPayment = await razorpay.payments.fetch(razorpay_payment_id);
-    if (razorPayment.status !== 'captured') {
+    /* 2. Fetch payment from Razorpay -------------------------------------- */
+    const rpPayment = await razorpay.payments.fetch(razorpay_payment_id);
+    if (rpPayment.status !== 'captured') {
       await Payment.findOneAndUpdate(
         { orderId: razorpay_order_id },
-        { status: razorPayment.status }
+        { status: rpPayment.status },
+        { session }
       );
-      return res.status(400).json({
-        success: false,
-        message: `Payment status: ${razorPayment.status}`
-      });
+      await session.commitTransaction();
+      return res.status(400).json({ success: false, message: `Payment ${rpPayment.status}` });
     }
 
-    // Update record as paid
-    await Payment.findOneAndUpdate(
+    /* 3. Update Payment doc ---------------------------------------------- */
+    const paymentDoc = await Payment.findOneAndUpdate(
       { orderId: razorpay_order_id },
       {
         paymentId: razorpay_payment_id,
         signature: razorpay_signature,
         status:    'paid',
-        paidAt:    new Date(),
-      }
+        paidAt:    new Date()
+      },
+      { new: true, session }
     );
 
-    return res.json({
-      success: true,
-      message: 'Payment verified successfully'
-    });
-  } catch (error) {
-    console.error('Error in verifyPayment:', error);
-    return res.status(500).json({
-      success: false,
-      message:  error.message
-    });
+    /* 4. Activate Subscription ------------------------------------------- */
+    // compute expiry from plan.durationMonths (if present)
+    const plan = await Plan.findOne({ planId: paymentDoc.planId }).session(session);
+    let expires = null;
+    if (plan && plan.durationMonths) {
+      expires = new Date();
+      expires.setMonth(expires.getMonth() + plan.durationMonths);
+    }
+
+    await Subscription.findOneAndUpdate(
+      { orderId: razorpay_order_id },
+      {
+        paymentId: razorpay_payment_id,
+        status:    'active',
+        startedAt: new Date(),
+        expiresAt: expires
+      },
+      { session }
+    );
+
+    /* 5. Commit + respond ------------------------------------------------- */
+    await session.commitTransaction();
+    res.json({ success: true, message: 'Payment verified, subscription active' });
+  } catch (err) {
+    await session.abortTransaction();
+    console.error('verifyPayment error:', err);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  } finally {
+    session.endSession();
   }
 };
