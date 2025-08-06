@@ -1,59 +1,185 @@
-const jwt = require('jsonwebtoken');
-const User = require('../model/user');
+// controllers/userController.js
+const express = require('express');
+const jwt         = require('jsonwebtoken');
+const nodemailer  = require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
+const User        = require('../model/user');
+const JWT_SECRET  = process.env.JWT_SECRET;
 
-const JWT_SECRET = process.env.JWT_SECRET;
+// configure your SMTP transporter
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT,10),
+  secure: process.env.SMTP_SECURE === 'true',
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
 
-/**
- * Register a new user
- * POST /user/register
- */
-exports.register = async (req, res) => {
-  const { name, email, password, phone, address } = req.body;
+
+exports.requestOtpUser = async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: 'Email is required' });
+
+  const code      = Math.floor(100000 + Math.random()*900000).toString();
+  const expiresAt = new Date(Date.now() + 10*60*1000);
 
   try {
-    const existingUser = await User.findOne({ email });
-    if (existingUser)
-      return res.status(400).json({ message: 'User already exists' });
-
-    const userId = uuidv4();
-
-    const newUser = new User({ userId, name, email, password, phone, address });
-    await newUser.save();
-
-    return res.status(201).json({ message: 'User registered successfully', userId });
-  } catch (err) {
-    console.error('Register error:', err);
+    await User.findOneAndUpdate(
+      { email },
+      { 
+        $set: {
+          otpCode:code,
+          otpExpiresAt: expiresAt,
+          otpVerified: false
+        }
+      },
+      { upsert: true, new: true }
+    );
+    await transporter.sendMail({
+      from: `"No-Reply" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: 'Your Verification Code',
+      text: `Your code is ${code}. It expires in 10 minutes.`
+    });
+    return res.json({ message: 'OTP sent to email' });
+  } catch(err) {
+    console.error('requestOtpUser error:', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
 
 /**
- * Login user
- * POST /user/login
+ * Step 2: Verify OTP & collect rest of profile
  */
-exports.login = async (req, res) => {
+exports.verifyOtpUser = async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) {
+    return res.status(400).json({ message: 'Email and otp are required' });
+  }
+
+  try {
+    const user = await User.findOneAndUpdate(
+      {
+        email: email.trim().toLowerCase(),
+        otpCode: otp.toString().trim(),
+        otpExpiresAt: { $gt: new Date() }
+      },
+      {
+        $set: { otpVerified: true },
+        $unset: { otpCode: "", otpExpiresAt: "" }
+      },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    return res.status(200).json({ message: 'OTP verified successfully' });
+  } catch (err) {
+    console.error('verifyOtpUser error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+/**
+ * Step 3: (Optional) If you want a separate “register” after OTP,
+ * you can check otpVerified and name/password already set.
+ * Otherwise, the above verifyOtpUser already seeds the user record.
+ */
+
+/**
+ * Login — exactly like before but guard on otpVerified
+ */
+exports.loginUser = async (req, res) => {
   const { email, password } = req.body;
+  if (!email||!password) {
+    return res.status(400).json({ message: 'Email and password required' });
+  }
 
   try {
     const user = await User.findOne({ email });
-    if (!user || !(await user.comparePassword(password))) {
+    if (!user || !user.otpVerified) {
+      return res.status(403).json({ message: 'Please verify your email first' });
+    }
+    const match = await user.comparePassword(password);
+    if (!match) {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
-
     const token = jwt.sign(
       { userId: user.userId },
       JWT_SECRET,
       { expiresIn: '100d' }
     );
-
-    return res.status(200).json({
+    res.status(200).json({
       message: 'Login successful',
       token,
-      userId: user.userId,
+      userId: user.userId
+    });
+  } catch(err) {
+    console.error('loginUser error:', err);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+
+exports.registerUser = async (req, res) => {
+  const {
+    email,
+    name,
+    password,
+    phone,
+    address,
+    countryId,
+    country,
+    callingId,
+    callingcode,
+    bio = '',
+    gender
+  } = req.body;
+
+  // Basic validation
+  if (!email || !name || !password || !countryId || !country || !callingId || !callingcode || gender == null) {
+    return res.status(400).json({ message: 'Missing required registration fields' });
+  }
+
+  try {
+    // 1) Fetch the user who must have otpVerified=true
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
+
+    if (!user) {
+      return res.status(404).json({ message: 'No OTP request found for this email' });
+    }
+    if (!user.otpVerified) {
+      return res.status(403).json({ message: 'Email not yet verified' });
+    }
+    if (user.name && user.password) {
+      return res.status(400).json({ message: 'User already registered' });
+    }
+
+    // 2) Apply the profile fields
+    user.name        = name;
+    user.password    = password;   // will be hashed by pre('save')
+    user.phone       = phone;
+    user.address     = address;
+    user.countryId   = countryId;
+    user.country     = country;
+    user.callingId   = callingId;
+    user.callingcode = callingcode;
+    user.bio         = bio;
+    user.gender      = Number(gender);
+
+    // 3) Save (triggers password hash)
+    await user.save();
+
+    return res.status(201).json({
+      message: 'User registered successfully',
+      userId: user.userId
     });
   } catch (err) {
-    console.error('Login error:', err);
+    console.error('registerUser error:', err);
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
@@ -206,5 +332,105 @@ exports.getById = async (req, res) => {
   } catch (err) {
     console.error('Get user by ID error:', err);
     return res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+
+exports.requestPasswordReset = async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: 'Email is required' });
+
+  const code      = Math.floor(100000 + Math.random()*900000).toString();
+  const expiresAt = new Date(Date.now() + 10*60*1000);
+
+  try {
+    const user = await User.findOneAndUpdate(
+      { email: email.trim().toLowerCase() },
+      {
+        $set: {
+          passwordResetCode: code,
+          passwordResetExpiresAt: expiresAt,
+          passwordResetVerified: false
+        }
+      },
+      { new: true }
+    );
+    if (!user) {
+      return res.status(404).json({ message: 'No user with that email' });
+    }
+
+    await transporter.sendMail({
+      from: `"No-Reply" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: 'Your Password Reset Code',
+      text: `Your reset code is ${code}. It expires in 10 minutes.`
+    });
+
+    res.json({ message: 'Reset OTP sent to email' });
+  } catch (err) {
+    console.error('requestPasswordReset error:', err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+/**
+ * 2️⃣ verifyPasswordResetOtp
+ */
+exports.verifyPasswordResetOtp = async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) {
+    return res.status(400).json({ message: 'Email and OTP are required' });
+  }
+
+  try {
+    const user = await User.findOneAndUpdate(
+      {
+        email: email.trim().toLowerCase(),
+        passwordResetCode: otp.toString().trim(),
+        passwordResetExpiresAt: { $gt: new Date() }
+      },
+      {
+        $set: { passwordResetVerified: true },
+        $unset: { passwordResetCode: "", passwordResetExpiresAt: "" }
+      },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+    res.json({ message: 'OTP verified, you may now reset your password' });
+  } catch (err) {
+    console.error('verifyPasswordResetOtp error:', err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+/**
+ * 3️⃣ resetPassword
+ */
+exports.resetPassword = async (req, res) => {
+  const { email, newPassword } = req.body;
+  if (!email || !newPassword) {
+    return res.status(400).json({ message: 'Email and newPassword are required' });
+  }
+
+  try {
+    const user = await User.findOne({ 
+      email: email.trim().toLowerCase(),
+      passwordResetVerified: true
+    });
+    if (!user) {
+      return res.status(403).json({ message: 'OTP not verified or invalid email' });
+    }
+
+    user.password              = newPassword;   // will get hashed
+    user.passwordResetVerified = false;        // clear the flag
+    await user.save();
+
+    res.json({ message: 'Password reset successfully' });
+  } catch (err) {
+    console.error('resetPassword error:', err);
+    res.status(500).json({ message: 'Internal server error' });
   }
 };
