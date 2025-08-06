@@ -1,24 +1,25 @@
 // controllers/userController.js
-const express = require('express');
-const jwt         = require('jsonwebtoken');
-const nodemailer  = require('nodemailer');
+const jwt       = require('jsonwebtoken');
+const nodemailer= require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
-const User        = require('../model/user');
-const Country = require('../model/country');
-const JWT_SECRET  = process.env.JWT_SECRET;
+const User      = require('../model/user');
+const Country   = require('../model/country');
+const JWT_SECRET= process.env.JWT_SECRET;
 
-// configure your SMTP transporter
+// SMTP transporter (fill in your .env)
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
-  port: parseInt(process.env.SMTP_PORT,10),
-  secure: process.env.SMTP_SECURE === 'true',
+  port: +process.env.SMTP_PORT,
+  secure: process.env.SMTP_SECURE==='true',
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
   }
 });
 
-
+/**
+ * 1️⃣ Send OTP (upsert email-only record, inject userId default)
+ */
 exports.requestOtpUser = async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: 'Email is required' });
@@ -28,31 +29,37 @@ exports.requestOtpUser = async (req, res) => {
 
   try {
     await User.findOneAndUpdate(
-      { email },
-      { 
+      { email: email.trim().toLowerCase() },
+      {
         $set: {
-          otpCode:code,
+          otpCode,
           otpExpiresAt: expiresAt,
           otpVerified: false
         }
       },
-      { upsert: true, new: true }
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true
+      }
     );
+
     await transporter.sendMail({
       from: `"No-Reply" <${process.env.SMTP_USER}>`,
       to: email,
       subject: 'Your Verification Code',
       text: `Your code is ${code}. It expires in 10 minutes.`
     });
-    return res.json({ message: 'OTP sent to email' });
-  } catch(err) {
+
+    res.json({ message: 'OTP sent to email' });
+  } catch (err) {
     console.error('requestOtpUser error:', err);
-    return res.status(500).json({ message: 'Internal server error' });
+    res.status(500).json({ message: 'Internal server error' });
   }
 };
 
 /**
- * Step 2: Verify OTP & collect rest of profile
+ * 2️⃣ Verify OTP only
  */
 exports.verifyOtpUser = async (req, res) => {
   const { email, otp } = req.body;
@@ -77,104 +84,86 @@ exports.verifyOtpUser = async (req, res) => {
     if (!user) {
       return res.status(400).json({ message: 'Invalid or expired OTP' });
     }
-
-    return res.status(200).json({ message: 'OTP verified successfully' });
+    res.json({ message: 'OTP verified successfully' });
   } catch (err) {
     console.error('verifyOtpUser error:', err);
-    return res.status(500).json({ message: 'Internal server error' });
+    res.status(500).json({ message: 'Internal server error' });
   }
 };
 
-
+/**
+ * 3️⃣ Complete registration (after OTP verified)
+ */
 exports.registerUser = async (req, res) => {
   const {
     email,
     name,
     password,
     phone,
-    address='',
+    address = '',
     countryId,
     callingId,
     bio = '',
     gender
   } = req.body;
 
-  // Basic validation
-  if (
-    !email ||
-    !name ||
-    !password ||
-    !phone ||
-    !countryId ||
-    !callingId ||
-    gender == null
-  ) {
-    return res.status(400).json({ message: 'Missing required registration fields' });
+  // required‐field check
+  if (!email || !name || !password || !phone || !countryId || !callingId || gender==null) {
+    return res.status(400).json({ message: 'Missing required fields' });
   }
-
-  // Map gender input to enum 0/1/2
-const genderVal = Number(gender);
-  if (![0, 1, 2].includes(genderVal)) {
+  const genderVal = Number(gender);
+  if (![0,1,2].includes(genderVal)) {
     return res.status(400).json({
-      message: 'Invalid gender value; must be 0 (male), 1 (female), or 2 (other)'
+      message: 'gender must be 0=male,1=female or2=other'
     });
   }
 
   try {
-    // 1) Fetch the user who must have otpVerified=true
     const user = await User.findOne({ email: email.trim().toLowerCase() });
-    if (!user) {
-      return res.status(404).json({ message: 'No OTP request found for this email' });
-    }
-    if (!user.otpVerified) {
-      return res.status(403).json({ message: 'Email not yet verified' });
-    }
-    if (user.name && user.password) {
-      return res.status(400).json({ message: 'User already registered' });
+    if (!user)           return res.status(404).json({ message: 'No OTP found' });
+    if (!user.otpVerified) return res.status(403).json({ message: 'OTP not verified' });
+    if (user.name)       return res.status(400).json({ message: 'Already registered' });
+
+    // ensure phone unique
+    const dup = await User.findOne({ phone: phone.trim() });
+    if (dup && dup.email !== user.email) {
+      return res.status(409).json({ message: 'Phone already in use' });
     }
 
-    // 2) Ensure phone is unique
-    const existingPhone = await User.findOne({ phone: phone.trim() });
-    if (existingPhone && existingPhone.email !== user.email) {
-      return res.status(409).json({ message: 'Phone number already in use' });
-    }
-
-    // 3) Lookup Country docs
-    const [ countryDoc, callingDoc ] = await Promise.all([
+    // lookup countries
+    const [ cd, callcd ] = await Promise.all([
       Country.findById(countryId),
       Country.findById(callingId)
     ]);
-    if (!countryDoc || !callingDoc) {
+    if (!cd || !callcd) {
       return res.status(400).json({ message: 'Invalid countryId or callingId' });
     }
 
-    // 4) Apply the profile fields
-    user.name         = name;
-    user.password     = password;               // will be hashed by pre('save')
-    user.phone        = phone.trim();
-    user.address      = address || '';
-    user.countryId    = countryId;
-    user.country      = countryDoc.name;
-    user.callingId    = callingId;
-    user.callingcode  = callingDoc.callingCode;
-    user.bio          = bio;
-    user.gender       = genderVal;
+    // apply profile
+    user.name        = name;
+    user.password    = password;          // will be hashed
+    user.phone       = phone.trim();
+    user.address     = address;
+    user.countryId   = countryId;
+    user.country     = cd.countryName;    // correct field
+    user.callingId   = callingId;
+    user.callingcode = callcd.callingCode;
+    user.bio         = bio;
+    user.gender      = genderVal;
 
-    // 5) Save (triggers password hash)
     await user.save();
-
-    return res.status(201).json({
+    res.status(201).json({
       message: 'User registered successfully',
       userId: user.userId
     });
   } catch (err) {
     console.error('registerUser error:', err);
-    return res.status(500).json({ message: 'Internal server error' });
+    res.status(500).json({ message: 'Internal server error' });
   }
 };
 
 /**
- * Login — exactly like before but guard on otpVerified
+ * 4️⃣ Login (only if otpVerified & registered)
  */
 exports.loginUser = async (req, res) => {
   const { email, password } = req.body;
@@ -183,27 +172,21 @@ exports.loginUser = async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
     if (!user || !user.otpVerified) {
-      return res.status(403).json({ message: 'Please verify your email first' });
+      return res.status(403).json({ message: 'Please verify email first' });
     }
-    const match = await user.comparePassword(password);
-    if (!match) {
+    if (!(await user.comparePassword(password))) {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
-    const token = jwt.sign(
-      { userId: user.userId },
-      JWT_SECRET,
-      { expiresIn: '100d' }
-    );
-    res.status(200).json({
-      message: 'Login successful',
-      token,
-      userId: user.userId
+
+    const token = jwt.sign({ userId: user.userId }, JWT_SECRET, {
+      expiresIn: '100d'
     });
-  } catch(err) {
+    res.json({ message: 'Login successful', token, userId: user.userId });
+  } catch (err) {
     console.error('loginUser error:', err);
-    return res.status(500).json({ message: 'Internal server error' });
+    res.status(500).json({ message: 'Internal server error' });
   }
 };
 

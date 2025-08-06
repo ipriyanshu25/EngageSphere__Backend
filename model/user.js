@@ -1,38 +1,64 @@
 // models/User.js
-const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
+const mongoose   = require('mongoose');
+const bcrypt     = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 
 const userSchema = new mongoose.Schema({
-  userId:    { type: String, required: true, unique: true },
-  name:      { type: String, required: true },
-  email:     { type: String, required: true, unique: true, lowercase: true },
-  password:  { type: String, required: true },
-  phone:     { type: String, required: true, unique: true },
-  address:  { type: String, default: '' },
+  userId: {
+    type: String,
+    required: true,
+    unique: true,
+    default: () => uuidv4()
+  },
+  name: {
+    type: String,
+    required: function() { return this.otpVerified; }
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true,
+    trim: true
+  },
+  password: {
+    type: String,
+    required: function() { return this.otpVerified; }
+  },
+  phone: {
+    type: String,
+    unique: true,
+    trim: true,
+    required: function() { return this.otpVerified; }
+  },
+  address: {
+    type: String,
+    default: ''
+  },
 
   // OTP support
   otpCode:      String,
   otpExpiresAt: Date,
   otpVerified:  { type: Boolean, default: false },
 
-  // New profile fields
+  // Profile fields (required only once otpVerified)
   countryId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Country',
-    required: function () { return this.otpVerified; }
+    required: function() { return this.otpVerified; }
   },
   country: {
     type: String,
-    required: function () { return this.otpVerified; }
+    required: function() { return this.otpVerified; }
   },
   callingId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Country',
-    required: function () { return this.otpVerified; }
+    required: function() { return this.otpVerified; }
   },
   callingcode: {
     type: String,
-    required: function () { return this.otpVerified; }
+    required: function() { return this.otpVerified; }
   },
   bio: {
     type: String,
@@ -40,24 +66,27 @@ const userSchema = new mongoose.Schema({
   },
   gender: {
     type: Number,
-    enum: [0, 1, 2],
-    required: function () { return this.otpVerified; }
+    enum: [0, 1, 2], // 0=male,1=female,2=other
+    required: function() { return this.otpVerified; }
   },
+
+  // Password-reset support
   passwordResetCode:      String,
   passwordResetExpiresAt: Date,
   passwordResetVerified:  { type: Boolean, default: false }
+
 }, { timestamps: true });
 
-// Hash password
-userSchema.pre('save', async function (next) {
+// Hash password whenever modified
+userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
-  const salt = await bcrypt.genSalt(10);
-  this.password = await bcrypt.hash(this.password, salt);
+  this.password = await bcrypt.hash(this.password, await bcrypt.genSalt(10));
   next();
 });
 
-userSchema.methods.comparePassword = function (candidatePassword) {
-  return bcrypt.compare(candidatePassword, this.password);
+// Compare helper
+userSchema.methods.comparePassword = function(candidate) {
+  return bcrypt.compare(candidate, this.password);
 };
 
 module.exports = mongoose.model('User', userSchema);
