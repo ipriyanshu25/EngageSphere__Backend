@@ -15,6 +15,7 @@ const plan = require('./routes/planRoutes');
 const adminRoutes = require('./routes/adminRoutes'); // ✅ NEW: admin panel API
 const service = require('./routes/servicesRoutes')
 const countryRoutes = require('./routes/countryRoutes'); // ✅ NEW: country API
+const subscriptionRoutes = require('./routes/subscriptionRoutes'); // ✅ NEW: subscription API
 
 const app = express();
 
@@ -35,6 +36,7 @@ app.use('/plan', plan);   // View/update services
 app.use('/admin', adminRoutes);       // ✅ Admin dashboard metrics or control
 app.use('/services', service); // ✅ NEW: services API
 app.use('/country', countryRoutes); // ✅ NEW: country API
+app.use('/subscription', subscriptionRoutes); // ✅ NEW: subscription API
 
 // ✅ Connect to MongoDB and Start Server (Updated)
 const PORT = process.env.PORT || 5000;

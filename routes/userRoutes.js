@@ -29,7 +29,7 @@ router.post('/updatePass',            uc.resetPassword);
 
 // ─── Public / Read routes ────────────────────────────────────────
 // Get a user by ID
-router.post('/getById',            uc.verifyToken, uc.getById);
+router.post('/getById',           uc.getById);
 
 // ─── Protected / Write routes ────────────────────────────────────
 // Update profile (must be logged in)

@@ -1,5 +1,6 @@
 // controllers/userController.js
 const jwt       = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const nodemailer= require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
 const User      = require('../model/user');
@@ -32,7 +33,7 @@ exports.requestOtpUser = async (req, res) => {
       { email: email.trim().toLowerCase() },
       {
         $set: {
-          otpCode,
+          otpCode:code,
           otpExpiresAt: expiresAt,
           otpVerified: false
         }
@@ -100,10 +101,8 @@ exports.registerUser = async (req, res) => {
     name,
     password,
     phone,
-    address = '',
     countryId,
     callingId,
-    bio = '',
     gender
   } = req.body;
 
@@ -143,12 +142,10 @@ exports.registerUser = async (req, res) => {
     user.name        = name;
     user.password    = password;          // will be hashed
     user.phone       = phone.trim();
-    user.address     = address;
     user.countryId   = countryId;
     user.country     = cd.countryName;    // correct field
     user.callingId   = callingId;
     user.callingcode = callcd.callingCode;
-    user.bio         = bio;
     user.gender      = genderVal;
 
     await user.save();
@@ -278,7 +275,7 @@ exports.getAllUsersSimple = async (req, res) => {
  */
 exports.updateProfile = async (req, res) => {
   try {
-    const { name, phone, address, oldPassword, newPassword ,userId} = req.body;
+    const { name, phone, oldPassword, newPassword ,userId} = req.body;
 
     const user = await User.findOne({ userId });
     if (!user)
@@ -286,7 +283,6 @@ exports.updateProfile = async (req, res) => {
 
     if (name) user.name = name;
     if (phone) user.phone = phone;
-    if (address) user.address = address;
 
     if (newPassword) {
       if (!oldPassword) {
@@ -306,7 +302,6 @@ exports.updateProfile = async (req, res) => {
       name: user.name,
       email: user.email,
       phone: user.phone,
-      address: user.address,
       createdAt: user.createdAt,
     };
 

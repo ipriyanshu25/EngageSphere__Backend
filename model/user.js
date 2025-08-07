@@ -31,10 +31,6 @@ const userSchema = new mongoose.Schema({
     trim: true,
     required: function() { return this.otpVerified; }
   },
-  address: {
-    type: String,
-    default: ''
-  },
 
   // OTP support
   otpCode:      String,
@@ -59,10 +55,6 @@ const userSchema = new mongoose.Schema({
   callingcode: {
     type: String,
     required: function() { return this.otpVerified; }
-  },
-  bio: {
-    type: String,
-    default: ''
   },
   gender: {
     type: Number,
